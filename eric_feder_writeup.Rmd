@@ -1,0 +1,217 @@
+---
+title: "Predicting Flight Time"
+author: "Eric Feder"
+output: 
+  html_document: 
+    theme: readable
+    toc: yes
+    toc_depth: 4
+---
+
+Note: The .Rmd file and the accompanying csv files can be found [here](https://github.com/ef2240/flights).
+
+### Objective
+I would like to see what factors are predictive of a flight's actual elapsed time and how strong of a model I might be able to build. For purposes of this project, I am ignoring any delays that come before the plane leaves the departure gate, and am looking exclusively at the time elapsed from departure until arrival.
+
+### Data processing
+The steps below cover the data import and basic formatting of variables. The files in the Input_data/ folder cover 24 months of flight data, downloaded from [this link](http://www.transtats.bts.gov/DL_SelectFields.asp?Table_ID=236&DB_Short_Name=On-Time).
+```{r, warning=FALSE, message=FALSE}
+# # Install packages
+# install.packages("data.table")
+# install.packages("ggplot2")
+# install.packages("gbm")
+# install.packages("cvTools")
+
+# Load package
+library(data.table)
+library(ggplot2)
+library(gbm)
+library(cvTools)
+
+# Read in data
+flight.files <- list.files("Input_data/", full.names=T)
+flights.list <- lapply(flight.files, read.csv)
+
+# Merge data frames into one large data table
+flights <- rbindlist(flights.list)
+
+# Convert DAY_OF_WEEK AND MONTH to factors
+flights$DAY_OF_WEEK <- factor(flights$DAY_OF_WEEK)
+flights$MONTH <- factor(flights$MONTH)
+```
+
+#### Selecting a data sample
+To reduce the size of my dataset and reduce the potential impact of outliers, I narrowed my analysis to flights that both depart from, and arrive at, one of the twenty most popular airports. I also removed cancelled and diverted flights (i.e. flights with no actual ellapsed time) from the sample, to simplify the analysis.
+```{r}
+# Filter out flights that got cancelled or diverted
+flights.arrived <- flights[!is.na(ACTUAL_ELAPSED_TIME)]
+
+# Filter to paths between top 20 airports (using Origin or Destination airports yield identical lists)
+top20.airports <- flights.arrived[, .N, by=ORIGIN][order(N, decreasing=T)][1:20, ORIGIN]
+flights.top.airports <- flights.arrived[ORIGIN %in% top20.airports & DEST %in% top20.airports]
+```
+
+### Exploratory analysis
+#### Day of the Week
+The plot below suggests no significant variations in flight time by day of the week. Hence, I did not include it as one of my predictor variables.
+```{r, warning=FALSE}
+# Save preferred background aesthetics (no grid, no background color) as object
+no.bg <- theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"))
+
+# Find flight time by day of week
+day.of.week.plot <- ggplot(flights.top.airports, aes(x=DAY_OF_WEEK, y=ACTUAL_ELAPSED_TIME)) + geom_boxplot(outlier.shape=NA)
+boxplot.ylim <- boxplot.stats(flights.top.airports$ACTUAL_ELAPSED_TIME)$stats[c(1, 5)]
+day.of.week.plot + ylim(boxplot.ylim) + xlab("Day of the Week (Monday-Sunday)") + ylab("Flight Times (in minutes)")
+```
+
+#### Distance
+I found that the flight's distance is, unsurprisingly, strongly correlated with the flight's time. I made the points semi-transparent to handle overplotting.
+```{r, cache=TRUE}
+# Compare distance to flight time
+flight.vs.distance.plot <- ggplot(flights.top.airports, aes(x=DISTANCE, y=ACTUAL_ELAPSED_TIME))
+flight.vs.distance.plot + geom_point(alpha=0.003) + no.bg + xlab("Distance between Airport (in miles)") + ylab("Flight Time (in minutes)")
+
+# Find correlation between flight time and flight distance
+cor(flights.top.airports$DISTANCE, flights.top.airports$ACTUAL_ELAPSED_TIME)
+```
+Since Distance is such a significant predictor, in my further exploratory analysis, I will see whether additional variables can explain any of the variance in flight time that Distance was unable to (i.e. the residual between the actual flight time and the flight time expected based solely on Distance).
+```{r}
+# Fit linear regression just based on Distance and residuals to flights data table
+distance.model <- lm(ACTUAL_ELAPSED_TIME ~ DISTANCE, data=flights.top.airports)
+flights.top.airports$elapsed.resid <- resid(distance.model)
+```
+
+
+#### Time of Day
+While flights that depart between 7AM and 9PM, on average, last as long as would be expected based on their distances, flights that depart at night or early in the morning, tend to be shorter than expected. With more time, I would have liked to examine whether there were any other meaningful differences between these two sets of flights that could be confounding variables. (For instance, perhaps some routes only depart at night.) However, for my analysis, I will assume that time of day has at least some predictive power.
+```{r, warning=FALSE, fig.width=11}
+# Save object to rotate x-axis labels 45 degrees
+rotate45 <- theme(axis.text.x=element_text(angle=45, hjust=1))
+
+# Does time of day matter?
+dep.time.resid.plot <- ggplot(flights.top.airports, aes(x=DEP_TIME_BLK, y=elapsed.resid)) + geom_boxplot(outlier.shape=NA)
+boxplot.ylim <- boxplot.stats(flights.top.airports$elapsed.resid)$stats[c(1, 5)]
+dep.time.resid.plot + ylim(boxplot.ylim) + no.bg + xlab("Departure Time") + ylab("Difference between Actual and Expected Flight Times") + rotate45
+```
+
+
+#### Month
+The plot below suggests some degree of seasonality, as flights in the winter tend to take longer than would be expected based on their distances, perhaps a result of inclement weather. However, because the differences are so small (less than five minutes even at the extremes), I decided not to include it in my model.
+```{r, fig.width=11}
+# Is there seasonality?
+mean.resid.by.month <- flights.top.airports[, list(mean.resid=mean(elapsed.resid)), by=list(month.yr=sprintf("%d-%02.f", YEAR, MONTH))]
+seasonality.plot <- ggplot(mean.resid.by.month, aes(x=month.yr, y=mean.resid, group=1))
+seasonality.plot + geom_line() + xlab("Month") + ylab("Difference between Actual and Expected Flight Times") + rotate45
+```
+
+#### Departure and Arrival Airport
+Running an ANOVA test suggests that the departure and arrival airports have predictive power, even after accounting for flights distances.
+```{r}
+# Are origin and destination airports important?
+aov.origin <- aov(elapsed.resid ~ ORIGIN, data=flights.top.airports)
+summary(aov.origin)
+aov.dest <- aov(elapsed.resid ~ DEST, data=flights.top.airports)
+summary(aov.dest)
+```
+
+Interestingly, I discovered that flights which originate at airports on the East Coast tended to have positive residuals. However, when flights land at airports on the East Coast, they tended to have negative residuals. Furthermore, the reverse was true for airports on the West Coast. It seems that eastbound flights are quicker than westbound flights, perhaps due to wind patterns. With more time, I would have liked to encode a flight's direction as an explicit predictor variable.
+```{r}
+# Does direction matter?
+origin.resid <- flights.top.airports[, list(origin.mean.resid=mean(elapsed.resid)), keyby=ORIGIN]
+dest.resid <- flights.top.airports[, list(dest.mean.resid=mean(elapsed.resid)), keyby=DEST]
+origin.resid[dest.resid]
+```
+
+#### Carrier
+Finally, the differences between carriers seem to be significant enough to warrant including the flight's carrier as a predictor variable.
+```{r, warning=FALSE}
+# Is carrier significant?
+carrier.resid.plot <- ggplot(flights.top.airports, aes(x=CARRIER, y=elapsed.resid)) + geom_boxplot(outlier.shape=NA)
+boxplot.ylim <- boxplot.stats(flights.top.airports$elapsed.resid)$stats[c(1, 5)]
+carrier.resid.plot + ylim(boxplot.ylim) + no.bg + xlab("Carrier") + ylab("Difference between Actual and Expected Flight Times")
+```
+
+
+### Model Fitting
+
+#### Choice of predictor variables
+Based on the exploratory analysis above, I will use the following variables as model inputs: 
+
+* carrier
+* origin
+* destination
+* departure time (based on hour of the day)
+* distance
+```{r}
+# Drop variables not needed for modeling
+flights.top.airports[, c("YEAR", "MONTH", "DAY_OF_WEEK", "elapsed.resid") := NULL]
+```
+
+#### Model Evaluation
+To measure how much of the variation in flight time the various models explain, I will use $R^2$ as my metric for evaluation.
+
+#### Model Training
+##### Baseline Linear Regression (Distance Only)
+To start, I wanted a baseline to compare all subsequent models against, so I used the linear regression with Distance as the only predictor variable that I fit earlier.
+
+##### Airlines model
+Additionally, I compared the subsequent models to the airlines' model, i.e. the Elapsed Time as projected by the CRS.
+```{r}
+# Create "predict" function for the airlines model
+predict.airlines.model <- function(data){
+  return(data$CRS_ELAPSED_TIME)
+}
+```
+
+##### Linear Regression
+Next, I fit a linear regression using all of the predictor variables.
+```{r}
+# Fit full linear regression
+lm.model <- lm(ACTUAL_ELAPSED_TIME ~ . - CRS_ELAPSED_TIME, data=flights.top.airports)
+```
+
+
+##### GBM
+Finally, I tried fitting boosting trees, to see if a more complex model might be able to better capture some of the nuances of the data:
+```{r}
+# Fit GBM
+gbm.model <- gbm(ACTUAL_ELAPSED_TIME ~ . - CRS_ELAPSED_TIME, data=flights.top.airports, interaction.depth=4, distribution="gaussian", n.trees=1500, shrinkage=0.005)
+```
+
+#### Comparing Models
+Using k-fold cross-validation, I calculated the $R^2$ of each of the different models.
+```{r}
+# Set number of folds for cross-validation
+K <- 2
+
+# Function to calculate R squared
+calculateR2 <- function(actual, predicted){ return(cor(actual, predicted) ^ 2)}
+
+# Evaluate models using k-fold cross-validation
+distance.r2 <- cvFit(distance.model, data=flights.top.airports, y=flights.top.airports$ACTUAL_ELAPSED_TIME, cost=calculateR2, K=K)
+airlines.r2 <- calculateR2(flights.top.airports$ACTUAL_ELAPSED_TIME, predict.airlines.model(flights.top.airports))
+lm.r2 <- cvFit(lm.model, data=flights.top.airports, y=flights.top.airports$ACTUAL_ELAPSED_TIME, cost=calculateR2, K=K)
+gbm.r2 <- cvFit(gbm.model, data=flights.top.airports, y=flights.top.airports$ACTUAL_ELAPSED_TIME, cost=calculateR2, K=K, predictArgs=list(n.trees=1200, type="response"))
+```
+
+The results are as follows:
+
+Model                           | R squared
+--------------------------------|--------------------
+Distance-only Linear Regression | `r distance.r2$cv`
+Airlines (i.e. CRS)             | `r airlines.r2`
+Full Linear Regression          | `r lm.r2$cv`
+GBM                             | `r gbm.r2$cv`
+
+The full linear regression as well as the GBM both do around as well as the airlines do, all of which are clearly better than the distance-only model. It is interesting that I was able to nearly replicate the airlines' success, with relatively minimal effort. However, to be fair, the airlines may not necessarily be optimizing for accuracy alone. For instance, they may prefer to provide an overestimate than an underestimate, as customers will get frustrated with what they perceive to be a delayed arrival.
+
+### Future Steps
+
+With more time, there are a few more steps I would like to have taken:
+
+* Currently, I simply ignored all cancelled or diverted flights. I would have liked to come up with a more rigorous approach to handling these cases.
+* I would have liked to go further back in time and see if there are overall trends with regards to flight time that could help our model. Going back further in time also would have given better insight into the presence, or lack thereof, of seasonality.
+* Other regression techniques, such as Random Forests, SVM, and k-NN, could potentially have yielded better results.
+* As discussed above, a flight's direction seems to be significant, so encoding this explicitly may have helped.
+* Additionally, as discussed above, creating an indicator variable for night-time flights, instead of using a categorical variable with 19 different levels, may have more accurately represented the impact of departure time.
+* Finally, the addition of external data, such as weather data, may have been helpful.
