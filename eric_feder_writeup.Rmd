@@ -182,7 +182,7 @@ gbm.model <- gbm(ACTUAL_ELAPSED_TIME ~ . - CRS_ELAPSED_TIME, data=flights.top.ai
 Using k-fold cross-validation, I calculated the $R^2$ of each of the different models.
 ```{r}
 # Set number of folds for cross-validation
-K <- 2
+K <- 5
 
 # Function to calculate R squared
 calculateR2 <- function(actual, predicted){ return(cor(actual, predicted) ^ 2)}
